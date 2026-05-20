@@ -205,49 +205,118 @@ async function handlePingPredict(request, env, cors) {
 //  3. 客户端提交 Ping（新）
 //  接受来自 x-vpn 客户端的按小时 ping 结果，按国家聚合
 //  使用加权平均合并多次采样
+//  包含防滥用机制：频率限制、数据校验、节点上限
 // ================================================================
-async function handleClientPing(request, env, cors) {
-  const body = await request.json();
 
-  // 国家检测：优先 body.country，其次 CF 请求国家
+// 私有/内网 IP 前缀列表（用于拒绝伪造节点）
+const PRIVATE_PREFIXES = ['10.', '172.16.', '172.17.', '172.18.', '172.19.',
+  '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.',
+  '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.',
+  '192.168.', '127.', '0.', '169.254.', '::1', 'fc00:', 'fe80:'];
+
+function isPrivateIP(host) {
+  if (!host) return true;
+  return PRIVATE_PREFIXES.some(p => host.startsWith(p));
+}
+
+async function handleClientPing(request, env, cors) {
+  // ─── 1. 频率限制（每 IP 每 10 分钟只能提交一次） ───
+  const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const rateKey = `ratelimit:ping:${clientIP}`;
+  const rateCheck = await env.KV.get(rateKey);
+  if (rateCheck) {
+    return new Response(JSON.stringify({
+      error: 'Rate limited. Submit once per 10 minutes per IP.',
+      retry_after_seconds: 600,
+    }), {
+      status: 429,
+      headers: { 'Content-Type': 'application/json', 'Retry-After': '600', ...cors },
+    });
+  }
+
+  // ─── 2. 解析请求体 ───
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(JSON.stringify({ error: 'Invalid JSON' }), {
+      status: 400, headers: { 'Content-Type': 'application/json', ...cors },
+    });
+  }
+
+  // ─── 3. 国家检测 ───
   let country = (body.country || '').toUpperCase().trim();
   if (!country || country.length !== 2) {
     country = request.cf?.country || 'XX';
   }
 
-  const nodes = body.nodes || [];
-  if (!nodes.length) {
+  // ─── 4. 节点校验 ───
+  const rawNodes = body.nodes || [];
+  if (!Array.isArray(rawNodes) || rawNodes.length === 0) {
     return new Response(JSON.stringify({ error: 'No nodes provided' }), {
       status: 400, headers: { 'Content-Type': 'application/json', ...cors },
     });
   }
 
+  // 单次提交上限 200 个节点
+  const MAX_NODES = 200;
+  if (rawNodes.length > MAX_NODES) {
+    return new Response(JSON.stringify({
+      error: `Too many nodes. Max ${MAX_NODES} per submission.`,
+      max_allowed: MAX_NODES,
+    }), {
+      status: 400, headers: { 'Content-Type': 'application/json', ...cors },
+    });
+  }
+
+  // 过滤出合法节点
+  const validNodes = [];
+  for (const n of rawNodes) {
+    const server = (n.server || '').trim();
+    const port = parseInt(n.port) || 0;
+    const latency = parseInt(n.latency) || -1;
+    const type = (n.type || 'unknown').toLowerCase();
+
+    // server 不能为空、不能是私有 IP
+    if (!server || isPrivateIP(server)) continue;
+    // port 必须在有效范围
+    if (port < 1 || port > 65535) continue;
+    // latency 必须在合理范围（0~30000ms）
+    if (latency < 0 || latency > 30000) continue;
+    // type 必须是已知协议
+    const validTypes = ['vmess', 'vless', 'ss', 'trojan', 'http', 'socks5', 'socks', 'unknown'];
+    if (!validTypes.includes(type)) continue;
+
+    validNodes.push({ server, port, latency, type });
+  }
+
+  // 至少要有 1 个有效节点
+  if (validNodes.length === 0) {
+    return new Response(JSON.stringify({ error: 'No valid nodes after validation' }), {
+      status: 400, headers: { 'Content-Type': 'application/json', ...cors },
+    });
+  }
+
+  // ─── 5. 写入频率限制标记（10 分钟过期） ───
+  await env.KV.put(rateKey, '1', { expirationTtl: 600 });
+
+  // ─── 6. 聚合写入 KV ───
   const key = `ping:country:${country}`;
   const now = new Date().toISOString();
-
-  // 读取现有聚合数据
   let aggregated = (await env.KV.get(key, 'json')) || { nodes: {}, updated_at: now };
 
-  // 合并：加权平均
-  for (const n of nodes) {
+  for (const n of validNodes) {
     const nodeKey = `${n.server}:${n.port}`;
-    const newLatency = n.latency;
-    const newAlive = n.alive !== false && newLatency >= 0;
-
-    if (!newAlive) continue; // 只记录活着的节点
-
     const existing = aggregated.nodes[nodeKey];
     if (existing) {
-      // 加权平均：旧样本数 * 旧延迟 + 新延迟 / (旧样本数 + 1)
-      const samples = (existing.samples || 1);
-      const totalLatency = existing.latency * samples + newLatency;
-      existing.latency = Math.round(totalLatency / (samples + 1));
+      const samples = existing.samples || 1;
+      existing.latency = Math.round((existing.latency * samples + n.latency) / (samples + 1));
       existing.samples = samples + 1;
       existing.updated_at = now;
       existing.type = n.type || existing.type || 'unknown';
     } else {
       aggregated.nodes[nodeKey] = {
-        latency: newLatency,
+        latency: n.latency,
         samples: 1,
         type: n.type || 'unknown',
         updated_at: now,
@@ -256,14 +325,13 @@ async function handleClientPing(request, env, cors) {
   }
 
   aggregated.updated_at = now;
-
-  // 写入 KV（24h TTL）
   await env.KV.put(key, JSON.stringify(aggregated), { expirationTtl: 86400 });
 
   return new Response(JSON.stringify({
     ok: true,
     country,
-    nodes_received: nodes.length,
+    nodes_received: rawNodes.length,
+    nodes_valid: validNodes.length,
     nodes_stored: Object.keys(aggregated.nodes).length,
     updated_at: now,
   }), {

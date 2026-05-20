@@ -1,0 +1,26 @@
+name = "x-vpn-worker"
+main = "src/index.js"
+compatibility_date = "2025-05-01"
+
+# 路由
+routes = [
+  { pattern = "x-vpn.liangxiangan.top/*", zone_id = "{ZONE_ID}" }
+]
+
+# KV 存储
+kv_namespaces = [
+  { binding = "KV", id = "{KV_NAMESPACE_ID}" }
+]
+
+# Cron 触发器（每 10 分钟全球 Ping 备用）
+[triggers]
+crons = ["*/10 * * * *"]
+
+# 环境变量（可选）
+[vars]
+# PING_SECRET = "your-secret-here"
+# CF_REGION = "auto"
+
+# 环境：生产
+[env.production]
+vars = { CF_REGION = "auto" }

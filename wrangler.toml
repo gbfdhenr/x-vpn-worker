@@ -4,12 +4,12 @@ compatibility_date = "2025-05-01"
 
 # 路由
 routes = [
-  { pattern = "x-vpn.liangxiangan.top/*", zone_id = "{ZONE_ID}" }
+  { pattern = "x-vpn.liangxiangan.top/*", zone_id = "999223d158257209392697c20b4c1a57" }
 ]
 
 # KV 存储
 kv_namespaces = [
-  { binding = "KV", id = "{KV_NAMESPACE_ID}" }
+  { binding = "KV", id = "6f6502a0f133424d8474faef77f0808a" }
 ]
 
 # Cron 触发器（每 10 分钟全球 Ping 备用）

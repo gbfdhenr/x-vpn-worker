@@ -9,9 +9,9 @@
 //   0.  /                          主页：列出已解码的节点列表
 //   1.  /list/x-vpn.txt           订阅聚合（原始 base64，缓存 1h）
 //   2.  /api/ping/<region>        GET  读取区域延迟（旧格式）
-//   3.  /api/ping/list            GET  列出可用区域
-//   4.  /api/ping/predict         GET  按客户端国家返回预测延迟（新）
-//   5.  /api/client-ping          POST 客户端提交 ping 数据，按国家聚合（新）
+//   3.  /api/ping/list            GET  列出可用区域/省/国家
+//   4.  /api/ping/predict         GET  按客户端省份/国家返回预测延迟
+//   5.  /api/client-ping          POST 客户端提交 ping 数据，按省/国家聚合
 //   6.  /api/ping/<region>        POST 写入区域 Ping（受 shared_secret 保护）
 //   7.  /api/geo/<ip>             GET  地理位置（KV 缓存 24h）
 //   8.  /api/health               GET  健康检查
@@ -20,9 +20,53 @@
 // KV 存储模型:
 //   sub:YYYYMMDD                  → 订阅原始文本（1h TTL）
 //   ping:{region}                 → 旧格式：{ server: {port, latency, checked_at} }
-//   ping:country:{COUNTRY_CODE}   → 新格式(按国家聚合)：
+//   ping:country:{COUNTRY_CODE}   → 按国家聚合：
 //                                    { "server:port": {latency, samples, type, updated_at},
 //                                      updated_at: "ISO" }
+//   ping:province:{PROVINCE_CODE} → 按省/州聚合（中国省份粒度）：
+//                                    同上格式
+//   geo:{ip}                      → { country, country_code, city, isp }（24h TTL）
+
+// 中国城市→省份映射（用于 CF 请求自动识别省份）
+const CITY_TO_PROVINCE = {
+  'beijing': 'CN-BJ', 'bj': 'CN-BJ',
+  'shanghai': 'CN-SH', 'sh': 'CN-SH',
+  'guangzhou': 'CN-GD', 'shenzhen': 'CN-GD', 'dongguan': 'CN-GD', 'foshan': 'CN-GD',
+    'zhuhai': 'CN-GD', 'huizhou': 'CN-GD', 'zhongshan': 'CN-GD', 'shantou': 'CN-GD',
+    'jiangmen': 'CN-GD', 'zhanjiang': 'CN-GD', 'zhaoqing': 'CN-GD',
+  'chengdu': 'CN-SC', 'mianyang': 'CN-SC', 'deyang': 'CN-SC',
+  'hangzhou': 'CN-ZJ', 'ningbo': 'CN-ZJ', 'wenzhou': 'CN-ZJ', 'jiaxing': 'CN-ZJ',
+    'yiwu': 'CN-ZJ', 'shaoxing': 'CN-ZJ', 'taizhou': 'CN-ZJ',
+  'nanjing': 'CN-JS', 'suzhou': 'CN-JS', 'wuxi': 'CN-JS', 'changzhou': 'CN-JS',
+    'nantong': 'CN-JS', 'xuzhou': 'CN-JS', 'yangzhou': 'CN-JS', 'zhenjiang': 'CN-JS',
+  'wuhan': 'CN-HB', 'xiangyang': 'CN-HB', 'yichang': 'CN-HB',
+  'tianjin': 'CN-TJ', 'tj': 'CN-TJ',
+  'chongqing': 'CN-CQ', 'cq': 'CN-CQ',
+  'shenyang': 'CN-LN', 'dalian': 'CN-LN',
+  'qingdao': 'CN-SD', 'jinan': 'CN-SD', 'yantai': 'CN-SD', 'weifang': 'CN-SD',
+    'linyi': 'CN-SD', 'zibo': 'CN-SD', 'jining': 'CN-SD',
+  'xiamen': 'CN-FJ', 'fuzhou': 'CN-FJ', 'quanzhou': 'CN-FJ', 'zhangzhou': 'CN-FJ',
+  'changsha': 'CN-HN', 'zhuzhou': 'CN-HN', 'xiangtan': 'CN-HN',
+  'zhengzhou': 'CN-HA', 'luoyang': 'CN-HA', 'xinzheng': 'CN-HA',
+  'hefei': 'CN-AH', 'wuhu': 'CN-AH',
+  'xi\'an': 'CN-SN', 'xian': 'CN-SN', 'xianyang': 'CN-SN',
+  'kunming': 'CN-YN', 'lijiang': 'CN-YN',
+  'haerbin': 'CN-HL', 'harbin': 'CN-HL', 'daqing': 'CN-HL',
+  'changchun': 'CN-JL', 'jilin': 'CN-JL',
+  'taiyuan': 'CN-SX', 'datong': 'CN-SX',
+  'nanchang': 'CN-JX', 'jiujiang': 'CN-JX',
+  'guiyang': 'CN-GZ', 'zunyi': 'CN-GZ',
+  'nanning': 'CN-GX', 'guilin': 'CN-GX', 'liuzhou': 'CN-GX',
+  'lanzhou': 'CN-GS',
+  'wulumuqi': 'CN-XJ', 'urumqi': 'CN-XJ',
+  'huhehaote': 'CN-NM', 'hohhot': 'CN-NM', 'baotou': 'CN-NM',
+  'yinchuan': 'CN-NX',
+  'xining': 'CN-QH',
+  'lasa': 'CN-XZ', 'lhasa': 'CN-XZ',
+  'haikou': 'CN-HI', 'sanya': 'CN-HI',
+  'macau': 'CN-MO', 'macao': 'CN-MO',
+  'hongkong': 'CN-HK', 'hong kong': 'CN-HK',
+};
 //   geo:{ip}                      → { country, country_code, city, isp }（24h TTL）
 
 export default {
@@ -143,26 +187,49 @@ async function handleSubscription(url, env, cors) {
   });
 }
 
+function detectProvince(request) {
+  // 从 CF 请求中获取城市 → 映射到省份代码
+  const city = (request.cf?.city || '').toLowerCase().trim();
+  if (city && CITY_TO_PROVINCE[city]) {
+    return CITY_TO_PROVINCE[city];
+  }
+  // 也可以从 region 字段获取（部分 CF 节点提供）
+  const region = (request.cf?.region || '').toLowerCase().trim();
+  if (region && CITY_TO_PROVINCE[region]) {
+    return CITY_TO_PROVINCE[region];
+  }
+  return null;
+}
+
 // ================================================================
 //  2. 预测延迟（新）
-//  根据请求客户端所属国家，返回该国家所有客户提交的聚合延迟
-//  如果无数据则 fallback 到全局均值或 worker-edge 数据
+//  根据请求客户端所属省份/国家，返回聚合延迟
+//  优先级：省份数据 → 国家数据 → 全局均值 → Worker边缘
 // ================================================================
 async function handlePingPredict(request, env, cors) {
-  // 从 CF 请求中获取客户端国家
   const clientCountry = request.cf?.country || 'XX';
   const clientIp = request.headers.get('CF-Connecting-IP') || '';
 
-  // 尝试读取该国家的聚合数据
-  let countryData = await env.KV.get(`ping:country:${clientCountry}`, 'json');
-  let source = clientCountry;
+  // 1) 先尝试读取该省份的聚合数据（中国按省份）
+  const province = detectProvince(request);
+  let data = null;
+  let source = province || 'country';
 
-  // 如果没有数据，fallback 到 "auto"（Worker Cron 数据）
-  if (!countryData || !countryData.updated_at) {
+  if (province) {
+    data = await env.KV.get(`ping:province:${province}`, 'json');
+  }
+
+  // 2) 省份无数据，fallback 到国家
+  if (!data || !data.nodes || Object.keys(data.nodes).length === 0) {
+    data = await env.KV.get(`ping:country:${clientCountry}`, 'json');
+    source = clientCountry;
+  }
+
+  // 3) 国家无数据，fallback 到 Worker Cron（旧格式 ping:auto）
+  if (!data || !data.updated_at) {
     const autoData = await env.KV.get('ping:auto', 'json');
     if (autoData && autoData.updated_at) {
-      // 转换旧格式 -> 新格式
-      countryData = {
+      data = {
         nodes: {},
         updated_at: autoData.updated_at,
         source: 'worker-edge',
@@ -170,7 +237,7 @@ async function handlePingPredict(request, env, cors) {
       for (const [server, info] of Object.entries(autoData)) {
         if (server === 'colo' || server === 'updated_at') continue;
         const key = `${server}:${info.port || 443}`;
-        countryData.nodes[key] = {
+        data.nodes[key] = {
           latency: info.latency || -1,
           samples: 1,
           type: info.type || 'unknown',
@@ -182,20 +249,21 @@ async function handlePingPredict(request, env, cors) {
     source = 'worker-edge';
   }
 
-  // 如果没有数据就尝试所有国家的全局均值
-  if (!countryData || !countryData.nodes || Object.keys(countryData.nodes).length === 0) {
-    countryData = await aggregateGlobalPing(env);
+  // 4) 仍然无数据，聚合全局均值
+  if (!data || !data.nodes || Object.keys(data.nodes).length === 0) {
+    data = await aggregateGlobalPing(env);
     source = 'global';
   }
 
   return new Response(JSON.stringify({
     success: true,
     country: clientCountry,
+    province: province,
     client_ip: clientIp,
-    source: source || clientCountry,
-    updated_at: countryData?.updated_at || null,
-    nodes: countryData?.nodes || {},
-    node_count: countryData?.nodes ? Object.keys(countryData.nodes).length : 0,
+    source: source,
+    updated_at: data?.updated_at || null,
+    nodes: data?.nodes || {},
+    node_count: data?.nodes ? Object.keys(data.nodes).length : 0,
   }), {
     headers: { 'Content-Type': 'application/json', ...cors },
   });
@@ -248,6 +316,13 @@ async function handleClientPing(request, env, cors) {
   let country = (body.country || '').toUpperCase().trim();
   if (!country || country.length !== 2) {
     country = request.cf?.country || 'XX';
+  }
+
+  // ─── 3b. 省份检测（中国专用） ───
+  let province = (body.province || '').toUpperCase().trim();
+  if (!province) {
+    const detected = detectProvince(request);
+    if (detected) province = detected;
   }
 
   // ─── 4. 节点校验 ───
@@ -327,9 +402,31 @@ async function handleClientPing(request, env, cors) {
   aggregated.updated_at = now;
   await env.KV.put(key, JSON.stringify(aggregated), { expirationTtl: 86400 });
 
+  // ─── 6b. 同时写入省份级 KV（如果有省份信息） ───
+  if (province) {
+    const provKey = `ping:province:${province}`;
+    let provAgg = (await env.KV.get(provKey, 'json')) || { nodes: {}, updated_at: now };
+    for (const n of validNodes) {
+      const nodeKey = `${n.server}:${n.port}`;
+      const existing = provAgg.nodes[nodeKey];
+      if (existing) {
+        const samples = existing.samples || 1;
+        existing.latency = Math.round((existing.latency * samples + n.latency) / (samples + 1));
+        existing.samples = samples + 1;
+        existing.updated_at = now;
+        existing.type = n.type || existing.type || 'unknown';
+      } else {
+        provAgg.nodes[nodeKey] = { latency: n.latency, samples: 1, type: n.type || 'unknown', updated_at: now };
+      }
+    }
+    provAgg.updated_at = now;
+    await env.KV.put(provKey, JSON.stringify(provAgg), { expirationTtl: 86400 });
+  }
+
   return new Response(JSON.stringify({
     ok: true,
     country,
+    province: province || undefined,
     nodes_received: rawNodes.length,
     nodes_valid: validNodes.length,
     nodes_stored: Object.keys(aggregated.nodes).length,
@@ -347,18 +444,24 @@ async function handlePingList(env, cors) {
   const oldList = await env.KV.list({ prefix: 'ping:' });
   // 新格式 ping:country:{CODE}
   const countryList = await env.KV.list({ prefix: 'ping:country:' });
+  // 省份级 ping:province:{CODE}
+  const provList = await env.KV.list({ prefix: 'ping:province:' });
 
   const regions = oldList.keys
     .map(k => k.name.replace('ping:', ''))
-    .filter(r => r !== 'country'); // 排除新格式前缀
+    .filter(r => r !== 'country' && !r.startsWith('province'));
 
   const countries = countryList.keys
     .map(k => k.name.replace('ping:country:', ''));
 
+  const provinces = provList.keys
+    .map(k => k.name.replace('ping:province:', ''));
+
   return new Response(JSON.stringify({
     regions,
     countries,
-    all: [...new Set([...regions, ...countries])],
+    provinces,
+    all: [...new Set([...regions, ...countries, ...provinces])],
   }), {
     headers: { 'Content-Type': 'application/json', ...cors },
   });
@@ -371,6 +474,11 @@ async function handlePingGet(region, env, cors) {
   // 再尝试新格式（ping:country:{region}）
   if (!data) {
     data = await env.KV.get(`ping:country:${region}`, 'json');
+  }
+
+  // 再尝试省份格式（ping:province:{region}）
+  if (!data) {
+    data = await env.KV.get(`ping:province:${region}`, 'json');
   }
 
   return new Response(JSON.stringify({
@@ -657,7 +765,26 @@ async function handleHome(env, cors) {
   // 获取当天日期的订阅
   const now = new Date();
   const ds = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}`;
-  const cached = await env.KV.get(`sub:${ds}`);
+  let cached = await env.KV.get(`sub:${ds}`);
+
+  // 如果没有缓存，自动抓取一次
+  if (!cached) {
+    const urls = [
+      `https://raw.githubusercontent.com/free-nodes/v2rayfree/main/v${ds}2`,
+      `https://raw.githubusercontent.com/free-nodes/v2rayfree/main/v${ds}1`,
+    ];
+    for (const u of urls) {
+      try {
+        const r = await fetch(u);
+        if (r.ok) {
+          cached = await r.text();
+          await env.KV.put(`sub:${ds}`, cached, { expirationTtl: 3600 });
+          break;
+        }
+      } catch {}
+    }
+  }
+
   if (!cached) {
     return new Response('<html><body><h1>x-vpn</h1><p>No nodes available for today. <a href="/list/x-vpn.txt">Try raw subscription</a></p></body></html>', {
       headers: { 'Content-Type': 'text/html; charset=utf-8', ...cors },
